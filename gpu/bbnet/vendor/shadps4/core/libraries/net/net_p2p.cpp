@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -51,6 +53,8 @@ struct P2PState {
     u32 advertised_addr = 0;    // network order
     u32 relay_addr = 0;         // network order
     u16 relay_port = 0;         // network order
+    std::optional<P2P::Endpoint> bbsc_relay; // BBSC relay fallback (SetBbscRelayServer)
+    bool bbsc_relay_force = false;
     std::chrono::steady_clock::time_point retry_after{};
     std::pair<u16, Error> last_failure{0, Error::Ok};
 };
@@ -129,6 +133,7 @@ u16 StartLocked(P2PState& state, u16 udp_port, bool allow_fallback) {
     state.last_failure = {0, Error::Ok};
     const u16 port = transport->BoundPort();
     transport->SetRelayServer(RelayEndpoint(state));
+    transport->SetBbscRelay(state.bbsc_relay, state.bbsc_relay_force);
     state.transport = transport;
     Core::Net::SetP2PTransport(AF_INET, std::move(transport));
     if (udp_port != 0 && port != udp_port) {
@@ -310,6 +315,82 @@ void SetP2PRelayServer(u32 addr, u16 port) {
 void UseP2PRelayFor(u32 peer_addr) {
     if (const auto transport = RunningTransport()) {
         transport->UseRelayFor(peer_addr);
+    }
+}
+
+// BBSC relay fallback (p2p_transport.cpp): the BBSC game server's UDP relay, port 3478 on the
+// shadNet server's address. SHADPS4_P2P_RELAY: 0/off = none, auto/direct = only after 2 s of
+// silence (else every known peer from the first packet), a.b.c.d:port = another relay;
+// SHADPS4_P2P_RELAY_PORT = another port.
+void SetBbscRelayServer(u32 addr) {
+    const char* env = std::getenv("SHADPS4_P2P_RELAY");
+    const std::string mode = env != nullptr ? env : "";
+    const bool force = mode != "auto" && mode != "direct";
+    u16 port = 3478;
+    if (const char* p = std::getenv("SHADPS4_P2P_RELAY_PORT"); p != nullptr && *p != 0) {
+        const long parsed = std::strtol(p, nullptr, 10);
+        if (parsed > 0 && parsed < 65536) {
+            port = static_cast<u16>(parsed);
+        }
+    }
+    if (mode == "0" || mode == "off") {
+        addr = 0;
+    } else if (const size_t colon = mode.find(':'); colon != std::string::npos) {
+        in_addr parsed{};
+        const long parsed_port = std::strtol(mode.c_str() + colon + 1, nullptr, 10);
+        if (addr != 0 && inet_pton(AF_INET, mode.substr(0, colon).c_str(), &parsed) == 1 &&
+            parsed_port > 0 && parsed_port < 65536) {
+            addr = parsed.s_addr;
+            port = static_cast<u16>(parsed_port);
+        }
+    }
+    std::optional<P2P::Endpoint> relay;
+    if (addr != 0) {
+        sockaddr_in server{};
+        server.sin_family = AF_INET;
+        server.sin_addr.s_addr = addr;
+        server.sin_port = htons(port);
+        relay = P2P::Endpoint::FromSockaddr(reinterpret_cast<const sockaddr*>(&server),
+                                            sizeof(server));
+    }
+    auto& state = P2PStateInstance();
+    std::scoped_lock lock{state.mutex};
+    state.bbsc_relay = relay;
+    state.bbsc_relay_force = force;
+    if (state.transport) {
+        state.transport->SetBbscRelay(relay, force);
+    }
+}
+
+namespace {
+std::shared_ptr<P2P::Transport> CurrentTransport() {
+    auto& state = P2PStateInstance();
+    std::scoped_lock lock{state.mutex};
+    return state.transport;
+}
+} // namespace
+
+void SetBbscRelaySelf(u32 addr, u16 port) {
+    if (const auto transport = CurrentTransport()) {
+        transport->SetBbscRelaySelf(addr, port);
+    }
+}
+
+void SetBbscRelayLocalId(std::string_view online_id) {
+    if (const auto transport = CurrentTransport()) {
+        transport->SetBbscRelayLocalId(online_id);
+    }
+}
+
+void BbscRelayRememberPeer(std::string_view online_id, u32 addr, u16 port) {
+    if (const auto transport = CurrentTransport()) {
+        transport->BbscRelayRememberPeer(online_id, addr, port);
+    }
+}
+
+void BbscRelayKeepAlive() {
+    if (const auto transport = CurrentTransport()) {
+        transport->BbscRelayKeepAlive();
     }
 }
 

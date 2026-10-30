@@ -1,0 +1,42 @@
+# BBSC: bb-probe.exe (BBport 1.9.6 + BBSC's bbport-1.9.6-bbsc.patch) for Windows, built as
+# packaging/windows/README.md describes (MSYS2 CLANG64). The artifact holds bb-probe.exe and
+# the CLANG64 DLLs it loads (as package.sh collects them).
+name: BBSC bb-probe (Windows)
+on:
+  push:
+    branches: [ccr-5e726b09-om8cxa]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: git patch
+          pacboy: >-
+            toolchain:p cmake:p ninja:p pkgconf:p python:p
+            vulkan-headers:p vulkan-loader:p vulkan-memory-allocator:p glslang:p
+            sdl3:p fmt:p boost:p robin-map:p xxhash:p ffmpeg:p zydis:p
+            spirv-tools:p spirv-headers:p spirv-cross:p
+            protobuf:p openssl:p zlib:p miniupnpc:p nlohmann-json:p
+      - name: Build
+        run: bash build.sh || { cat out/gpu-build.log | grep -v '^\[' | tail -200; exit 1; }
+      - name: Collect bb-probe.exe and its DLLs
+        run: |
+          mkdir -p dist/bbsc-bb-probe/dlls
+          cp out/bb-probe.exe dist/bbsc-bb-probe/
+          ldd out/bb-probe.exe | awk '/\/clang64\/bin\// && !/vulkan-1\.dll/ {print $3}' |
+              sort -u | xargs -r -I{} cp {} dist/bbsc-bb-probe/dlls/
+          ls -la dist/bbsc-bb-probe dist/bbsc-bb-probe/dlls
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bbsc-bb-probe-1.9.6
+          path: dist/bbsc-bb-probe

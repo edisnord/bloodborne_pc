@@ -858,6 +858,7 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
         NpSignaling::Transport::SetMatching2Enabled(false);
         NpSignaling::Transport::SetMmServerEndpoint(0, 0);
         Net::SetP2PRelayServer(0, 0);
+        Net::SetBbscRelayServer(0);
         StopMatching2SignalingRuntime();
         return;
     }
@@ -877,6 +878,8 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
     NpSignaling::Transport::SetMatching2Enabled(matching2_enabled);
     NpSignaling::Transport::SetMmServerEndpoint(server_addr, server_udp_port);
     Net::SetP2PRelayServer(server_addr, server_udp_port);
+    // BBSC relay fallback: the BBSC game server's UDP relay runs on the shadNet server's address.
+    Net::SetBbscRelayServer(matching2_enabled ? server_addr : 0);
     if (!matching2_enabled) {
         StopMatching2SignalingRuntime();
     }

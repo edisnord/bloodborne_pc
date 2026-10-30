@@ -13,7 +13,10 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
+#include <string_view>
 #include <thread>
+#include <vector>
 
 #include "core/net/p2p_tcp.h"
 
@@ -214,6 +217,15 @@ public:
     void SetRelayServer(std::optional<Endpoint> relay_server);
     void UseRelayFor(u32 peer_addr); // IPv4, network order
 
+    // BBSC relay fallback ("BBR1", the BBSC game server's UDP relay; see p2p_transport.cpp).
+    // force: every known peer goes through it from the first packet (else after 2 s of
+    // silence). Addresses and ports in network order.
+    void SetBbscRelay(std::optional<Endpoint> relay_server, bool force);
+    void SetBbscRelaySelf(u32 addr, u16 port); // our public endpoint (STUN echo)
+    void SetBbscRelayLocalId(std::string_view online_id);
+    void BbscRelayRememberPeer(std::string_view online_id, u32 addr, u16 port);
+    void BbscRelayKeepAlive(); // often (the signaling thread): registers when due
+
 private:
     friend class DatagramSocket;
     friend class StreamSocket;
@@ -221,7 +233,9 @@ private:
     Transport(int family, std::unique_ptr<Codec> codec, const TransportConfig& config);
 
     void ThreadMain();
-    void HandlePacket(std::span<const u8> packet, const Endpoint& from, Clock::time_point now);
+    // relayed: it came through a relay, not straight from `from`.
+    void HandlePacket(std::span<const u8> packet, const Endpoint& from, Clock::time_point now,
+                      bool relayed = false);
     void HandleStreamSegment(std::span<const u8> bytes, const Endpoint& from,
                              Clock::time_point now);
     void HandleDatagram(Codec::Decoded& decoded, const Endpoint& from);
@@ -255,6 +269,51 @@ private:
     u64 loss_rng_ = 0x9e3779b97f4a7c15ull;
     std::optional<Endpoint> relay_server_;
     std::set<u32> relayed_peers_; // IPv4, network order
+
+    // BBSC relay fallback, mutex_ held for all of it.
+    // Direct = send directly only; Relay = through the relay only; Both = relay + a direct copy.
+    enum class BbscPath { Direct, Relay, Both };
+    struct BbscPeer {
+        std::string id; // online id, padded to 16 bytes
+        u32 addr = 0;   // the endpoint signaling uses: relayed packets arrive "from" it
+        u16 port = 0;
+        bool relayed = false;
+        bool direct_rx = false;
+        bool tx_started = false;
+        bool relay_seen = false; // it sent to us through the relay (it has the relay too)
+        Clock::time_point first_tx{};
+        Clock::time_point relayed_since{};
+        // The relay said it is not registered: direct only until then (asked again after).
+        Clock::time_point missing_until{};
+        bool missing_logged = false;
+        std::vector<std::vector<u8>> early; // sent directly before the switch (sent again then)
+    };
+    struct BbscRelay {
+        std::optional<Endpoint> server;
+        bool force = false;
+        bool acked = false;
+        u32 self_addr = 0;
+        u16 self_port = 0;
+        Clock::time_point started{};
+        Clock::time_point last_register{};
+        std::vector<std::string> local_ids;
+        std::map<std::string, BbscPeer> peers; // by padded online id
+        std::map<u64, std::string> alias;      // every known endpoint -> online id
+        u32 next_pseudo = 1;
+        u64 sent = 0;
+        u64 received = 0;
+        Clock::time_point last_status{};
+        u64 status_sent = 0;
+        u64 status_received = 0;
+        bool silence_logged = false;
+    } bbsc_;
+    void BbscAddAlias(const std::string& id, u32 addr, u16 port, const char* from);
+    BbscPeer* BbscFindPeer(u32 addr, u16 port);
+    BbscPath BbscRoute(std::span<const u8> packet, u32 addr, u16 port);
+    void BbscSendRelayed(const BbscPeer& peer, std::span<const u8> packet);
+    void BbscSendToRelay(const std::vector<u8>& packet);
+    void BbscNoteDirect(u32 addr, u16 port);
+    void BbscReceive(std::span<const u8> packet, Clock::time_point now);
 
     std::thread thread_;
     std::atomic<bool> stop_{false};

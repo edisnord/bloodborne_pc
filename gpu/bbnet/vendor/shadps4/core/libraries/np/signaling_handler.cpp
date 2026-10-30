@@ -7,13 +7,20 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
+#include <nlohmann/json.hpp>
+
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "common/singleton.h"
 #include "core/libraries/net/net.h"
 #include "core/libraries/net/net_p2p.h"
@@ -65,17 +72,147 @@ bool ShouldConnectToPeer(const NpMatching2::RoomCache& room,
     return true;
 }
 
+// BBSC: static peer map - "direct connection" mode.
+// When the players sit on a fixed virtual LAN (Tailscale / Radmin / ZeroTier) their addresses
+// never change, so asking the matchmaking server to resolve them is pure overhead and one more
+// thing that can be down. A configured entry wins over both the cached member address and the
+// server lookup, so a session comes up with no broker involved in addressing at all.
+//
+// Sources, in order (the first one to define an npid wins):
+//   SHADPS4_BBSC_PEERS   "npid=host:port,npid=host:port"
+//   bbsc_peers.json      in the user folder, path overridable with SHADPS4_BBSC_PEERS_JSON:
+//                        { "CLS_AMG": "100.101.102.103:41001" }
+// The port is that player's P2P UDP port.
+struct StaticPeer {
+    u32 addr_nbo = 0;
+    u16 port_nbo = 0;
+};
+
+bool ParseStaticPeerEndpoint(std::string_view text, StaticPeer& out) {
+    const auto colon = text.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 >= text.size()) {
+        return false;
+    }
+    const std::string host(text.substr(0, colon));
+    u32 port_host = 0;
+    for (const char c : text.substr(colon + 1)) {
+        if (c < '0' || c > '9') {
+            return false;
+        }
+        port_host = port_host * 10 + static_cast<u32>(c - '0');
+        if (port_host > 65535) {
+            return false;
+        }
+    }
+    if (port_host == 0) {
+        return false;
+    }
+    u32 addr_nbo = 0;
+    if (Net::sceNetInetPton(Net::ORBIS_NET_AF_INET, host.c_str(), &addr_nbo) <= 0) {
+        return false;
+    }
+    out.addr_nbo = addr_nbo;
+    out.port_nbo = Net::sceNetHtons(static_cast<u16>(port_host));
+    return true;
+}
+
+std::unordered_map<std::string, StaticPeer> LoadStaticPeerMap() {
+    std::unordered_map<std::string, StaticPeer> peers;
+    const auto add = [&peers](std::string npid, std::string_view endpoint) {
+        StaticPeer parsed;
+        if (npid.empty() || !ParseStaticPeerEndpoint(endpoint, parsed)) {
+            LOG_ERROR(Lib_NpSignaling, "BBSC static peer: ignoring bad entry '{}' -> '{}'", npid,
+                      endpoint);
+            return;
+        }
+        peers.emplace(std::move(npid), parsed);
+    };
+
+    if (const char* env = std::getenv("SHADPS4_BBSC_PEERS"); env != nullptr && env[0] != '\0') {
+        std::string_view rest{env};
+        while (!rest.empty()) {
+            const auto comma = rest.find(',');
+            const std::string_view item = rest.substr(0, comma);
+            rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(comma + 1);
+            if (const auto eq = item.find('='); eq != std::string_view::npos) {
+                add(std::string(item.substr(0, eq)), item.substr(eq + 1));
+            }
+        }
+    }
+
+    std::filesystem::path path;
+    if (const char* env = std::getenv("SHADPS4_BBSC_PEERS_JSON"); env != nullptr && env[0] != '\0') {
+        path = env;
+    } else {
+        path = Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "bbsc_peers.json";
+    }
+    if (std::ifstream f(path); f.is_open()) {
+        try {
+            const nlohmann::json doc = nlohmann::json::parse(f, nullptr, true, true);
+            for (const auto& [npid, value] : doc.items()) {
+                if (value.is_string()) {
+                    add(npid, value.get<std::string>());
+                }
+            }
+        } catch (const std::exception& e) {
+            LOG_ERROR(Lib_NpSignaling, "BBSC static peer: cannot parse {}: {}", path.string(),
+                      e.what());
+        }
+    }
+
+    if (!peers.empty()) {
+        LOG_INFO(Lib_NpSignaling, "BBSC static peer map: {} entries loaded", peers.size());
+    }
+    return peers;
+}
+
+bool LookupStaticPeer(const std::string& npid, StaticPeer& out) {
+    static const std::unordered_map<std::string, StaticPeer> peers = LoadStaticPeerMap();
+    if (peers.empty() || npid.empty()) {
+        return false;
+    }
+    const auto it = peers.find(npid);
+    if (it == peers.end()) {
+        return false;
+    }
+    out = it->second;
+    return true;
+}
+
+// A peer's endpoint by online id: the static map, else shadNet. The BBSC relay fallback learns
+// which online id sits behind each endpoint from here.
+bool ResolvePeerById(const std::string& online_id, u32* out_addr, u16* out_port) {
+    bool resolved = false;
+    if (StaticPeer fixed; LookupStaticPeer(online_id, fixed)) {
+        *out_addr = fixed.addr_nbo;
+        *out_port = fixed.port_nbo;
+        LOG_DEBUG(Lib_NpSignaling, "BBSC direct peer '{}' -> {:#x}:{} (no broker lookup)",
+                  online_id, *out_addr, Net::sceNetNtohs(*out_port));
+        resolved = true;
+    } else {
+        resolved = !online_id.empty() &&
+                   NpSignaling::Transport::ResolvePeer(online_id, out_addr, out_port) &&
+                   *out_addr != 0 && *out_port != 0;
+    }
+    if (resolved) {
+        Net::BbscRelayRememberPeer(online_id, *out_addr, *out_port);
+    }
+    return resolved;
+}
+
 bool ResolvePeerEndpoint(const NpMatching2::MemberCache& member, u32* out_addr, u16* out_port) {
+    const std::string online_id = OnlineIdString(member.np_id.handle);
+    // A configured fixed endpoint wins over the cached address too (BBSC direct mode).
+    if (StaticPeer fixed; LookupStaticPeer(online_id, fixed)) {
+        return ResolvePeerById(online_id, out_addr, out_port);
+    }
     if (member.addr != 0 && member.port != 0) {
         *out_addr = member.addr;
         *out_port = member.port;
+        Net::BbscRelayRememberPeer(online_id, *out_addr, *out_port);
         return true;
     }
-
-    const std::string online_id = OnlineIdString(member.np_id.handle);
-    return !online_id.empty() &&
-           NpSignaling::Transport::ResolvePeer(online_id, out_addr, out_port) && *out_addr != 0 &&
-           *out_port != 0;
+    return ResolvePeerById(online_id, out_addr, out_port);
 }
 
 bool HasSignalingMagic(const u8* buf, size_t nbytes) {
@@ -101,6 +238,7 @@ void HandleStunEcho(const NpSignaling::StunEcho& echo) {
 
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
     netinfo->SetExternalIp(echo.ext_ip);
+    Net::SetBbscRelaySelf(echo.ext_ip, echo.ext_port);
 }
 
 void ProcessSignalingPacket(const void* data, u32 len, u32 from_addr, u16 from_port) {
@@ -214,6 +352,7 @@ bool PublishSignalingInfo(const OrbisNpOnlineId& online_id) {
     NpSignaling::StunPing ping{};
     std::memcpy(ping.online_id, online_id.data, ORBIS_NP_ONLINEID_MAX_LENGTH);
     ping.local_ip = NpSignaling::Transport::LocalAddr();
+    Net::SetBbscRelayLocalId(OnlineIdString(online_id));
 
     const int rc =
         NpSignaling::Transport::SignalingSendTo(&ping, sizeof(ping), server_addr, server_udp);
@@ -615,6 +754,74 @@ void StartTransportHandshakeInitiator(s32 transport_id) {
     }
 }
 
+// BBSC rejoin fix (from BBSC's bbport-1.7.2 patch, 2026-10-12). Two ways a peer that left and
+// came back got stuck on a transport we still counted as established:
+//  * the game activates the peer again after it deactivated (it left with the Silencing Blank):
+//    the dead transport was reused as "established" at once and nothing ever checked it, so the
+//    rejoin never came up. It is checked first now (BeginRevalidationLocked).
+//  * the peer started over (a new transport on its side, so a new id in its packets): its
+//    handshake hit our established transport, which never re-established it, and every rejoin
+//    died. The handshake starts again as if new (RestartHandshakeLocked).
+void SendRevalidationCheckLocked(NpSignaling::PeerTransport& transport) {
+    if (transport.addr == 0 || transport.port == 0) {
+        return;
+    }
+    NpSignaling::SignalingHandshake check =
+        MakeHandshakeLocked(transport, NpSignaling::HandshakeKind::Check);
+    check.nonce = static_cast<u64>(NpSignaling::NowUs());
+    SendHandshakeLocked(transport, check);
+    transport.handshake_start_us = 0; // established: no handshake attempt to time out
+}
+
+void BeginRevalidationLocked(NpSignaling::PeerTransport& transport) {
+    transport.revalidating = true;
+    transport.revalidate_since_us = NpSignaling::NowUs();
+    SendRevalidationCheckLocked(transport);
+    LOG_INFO(Lib_NpSignaling,
+             "Transport {} to '{}': activated again{} - checking the peer is still there (10 s)",
+             transport.transport_id, OnlineIdString(transport.online_id),
+             transport.peer_deactivated ? " after it deactivated" : "");
+}
+
+void RestartHandshakeLocked(NpSignaling::PeerTransport& transport, u32 new_peer_conn,
+                            NpSignaling::ConnState state, const char* why) {
+    LOG_INFO(Lib_NpSignaling,
+             "Transport {} to '{}': {} (its connection {} -> {}) - handshake again",
+             transport.transport_id, OnlineIdString(transport.online_id), why,
+             transport.peer_conn_id, new_peer_conn);
+    transport.transport_established_fired = false;
+    transport.peer_established = false;
+    transport.peer_deactivated = false;
+    transport.revalidating = false;
+    transport.peer_conn_id = new_peer_conn;
+    SetTransportStateLocked(transport, state);
+    transport.handshake_start_us = 0;
+    transport.last_handshake_send_us = 0;
+    // The game's events for it fire again once it is established again.
+    for (auto& [conn_id, ci] : NpHandler::GetInstance().GetSignalingState().connections) {
+        if (ci.transport_id != transport.transport_id) {
+            continue;
+        }
+        ci.sig1_established_event_fired = false;
+        ci.mutual_fired = false;
+        ci.peer_activated_fired = false;
+        SyncSig1StatusLocked(ci, transport);
+    }
+}
+
+const char* DeadReason(s32 sig_error_code) {
+    switch (sig_error_code) {
+    case ORBIS_NP_SIGNALING_ERROR_TIMEOUT:
+        return ": no answer";
+    case ORBIS_NP_SIGNALING_ERROR_TERMINATED_BY_PEER:
+        return ": closed by the peer";
+    case ORBIS_NP_SIGNALING_ERROR_TERMINATED_BY_MYSELF:
+        return ": closed by us";
+    default:
+        return "";
+    }
+}
+
 void QueueMatching2DeadForTransport(s32 transport_id, s32 error_code) {
     for (u32 id = 1; id <= NpMatching2::ContextManager::kMaxContexts; ++id) {
         auto ctx = NpHandler::GetInstance().GetMatching2ContextManager().Get(
@@ -667,6 +874,9 @@ void CloseConnectionAndDispatchDead(s32 conn_id, s32 sig_error_code, s32 matchin
         ci.status = NpSignaling::ORBIS_NP_SIGNALING_CONN_STATUS_INACTIVE;
         ci.dead_fired = true;
         fire_sig1 = ci.ctx_id != 0;
+        LOG_INFO(Lib_NpSignaling, "Connection {} to '{}' -> DEAD (errorCode={:#x}{})", conn_id,
+                 OnlineIdString(ci.online_id), static_cast<u32>(sig_error_code),
+                 DeadReason(sig_error_code));
     }
 
     if (transport_id != 0) {
@@ -690,6 +900,9 @@ void CloseTransportAndDispatchDead(s32 transport_id, s32 sig_error_code, s32 mat
         if (!transport || transport->state == NpSignaling::ConnState::Inactive) {
             return;
         }
+        LOG_INFO(Lib_NpSignaling, "Transport {} to '{}' -> DEAD (errorCode={:#x}{})",
+                 transport_id, OnlineIdString(transport->online_id),
+                 static_cast<u32>(sig_error_code), DeadReason(sig_error_code));
         SetTransportStateLocked(*transport, NpSignaling::ConnState::Inactive);
         for (auto& [conn_id, ci] : NpHandler::GetInstance().GetSignalingState().connections) {
             if (ci.transport_id != transport_id || ci.dead_fired) {
@@ -735,6 +948,9 @@ void EstablishConnection(s32 transport_id, bool peer_activated_hint) {
         if (peer_activated_hint) {
             transport->peer_activated = true;
         }
+        if (transport->revalidating) {
+            return; // BBSC rejoin fix: once the peer answers the Check
+        }
 
         if (!transport->transport_established_fired) {
             SetTransportStateLocked(*transport, NpSignaling::ConnState::Established);
@@ -776,6 +992,10 @@ void EstablishConnection(s32 transport_id, bool peer_activated_hint) {
         }
     }
 
+    if (first_establish) {
+        LOG_INFO(Lib_NpSignaling, "Transport {} -> ESTABLISHED, peer at {:#x}:{}", transport_id,
+                 peer_addr, Net::sceNetNtohs(peer_port));
+    }
     if (send_established) {
         NpSignaling::Transport::ControlSendTo(&established_pkt, sizeof(established_pkt), peer_addr,
                                               peer_port);
@@ -819,9 +1039,7 @@ void ProcessPendingActivations() {
 
         u32 peer_addr = 0;
         u16 peer_port = 0;
-        const bool resolved =
-            NpSignaling::Transport::ResolvePeer(act.peer_online_id, &peer_addr, &peer_port) &&
-            peer_addr != 0 && peer_port != 0;
+        const bool resolved = ResolvePeerById(act.peer_online_id, &peer_addr, &peer_port);
 
         if (!resolved) {
             LOG_DEBUG(Lib_NpSignaling,
@@ -898,6 +1116,16 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port,
             }
             auto& transport =
                 NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id];
+            if (transport.state == NpSignaling::ConnState::Established && pkt.from_conn_id != 0 &&
+                (transport.revalidating ||
+                 (transport.peer_conn_id != 0 && pkt.from_conn_id != transport.peer_conn_id))) {
+                RestartHandshakeLocked(transport, pkt.from_conn_id,
+                                       NpSignaling::ConnState::SendingAccept,
+                                       "the peer started over");
+            }
+            if (pkt.from_conn_id != 0) {
+                transport.peer_conn_id = pkt.from_conn_id;
+            }
             // Reply where the packet came from: the sender's mapped (public) address is
             // wrong for a peer on our own network, and the port is from the packet anyway.
             transport.addr = from_addr != 0 ? from_addr : pkt.mapped_addr;
@@ -914,6 +1142,9 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port,
         } else if (kind == NpSignaling::HandshakeKind::Accept) {
             auto& transport =
                 NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id];
+            if (pkt.from_conn_id != 0 && transport.state != NpSignaling::ConnState::Established) {
+                transport.peer_conn_id = pkt.from_conn_id;
+            }
             transport.peer_activated = true;
             transport.addr = from_addr != 0 ? from_addr : pkt.mapped_addr;
             transport.port = from_port;
@@ -930,6 +1161,9 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port,
         } else if (kind == NpSignaling::HandshakeKind::Check) {
             auto& transport =
                 NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id];
+            if (transport.peer_conn_id == 0 && pkt.from_conn_id != 0) {
+                transport.peer_conn_id = pkt.from_conn_id;
+            }
             reply = MakeHandshakeLocked(transport, NpSignaling::HandshakeKind::CheckAck);
             reply.nonce = pkt.nonce;
             send_reply = true;
@@ -948,8 +1182,18 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port,
                 transport.probe_rtt_samples[idx] = static_cast<s32>(rtt_us);
                 transport.probe_sample_write_index = idx + 1;
             }
-            if (NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id].state !=
-                NpSignaling::ConnState::Established) {
+            auto& transport =
+                NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id];
+            if (transport.peer_conn_id == 0 && pkt.from_conn_id != 0) {
+                transport.peer_conn_id = pkt.from_conn_id;
+            }
+            if (transport.revalidating) {
+                transport.revalidating = false;
+                transport.peer_deactivated = false;
+                LOG_INFO(Lib_NpSignaling, "Transport {} to '{}': the peer answered - kept",
+                         transport_id, from_id);
+                establish_transport = transport_id;
+            } else if (transport.state != NpSignaling::ConnState::Established) {
                 establish_transport = transport_id;
             }
         }
@@ -973,6 +1217,7 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::Signal
     const NpSignaling::ControlKind kind = static_cast<NpSignaling::ControlKind>(pkt.kind);
 
     s32 establish_transport = 0;
+    s32 restart_transport = 0;
     s32 dead_conn = 0;
     s32 peer_deactivated_conn = 0;
     NpSignaling::SignalingControl ack{};
@@ -1018,6 +1263,17 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::Signal
             }
             auto& transport =
                 NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id];
+            if (transport.state == NpSignaling::ConnState::Established && pkt.from_conn_id != 0 &&
+                transport.peer_conn_id != 0 && pkt.from_conn_id != transport.peer_conn_id) {
+                // It started over and waits for our Offer (we were the initiator before).
+                RestartHandshakeLocked(transport, pkt.from_conn_id,
+                                       NpSignaling::ConnState::SendingOffer,
+                                       "activation request on a new connection");
+                restart_transport = transport_id;
+            }
+            if (pkt.from_conn_id != 0 && transport.state != NpSignaling::ConnState::Established) {
+                transport.peer_conn_id = pkt.from_conn_id;
+            }
             transport.peer_activated = true;
             transport.addr = from_addr != 0 ? from_addr : pkt.mapped_addr;
             transport.port = from_port;
@@ -1099,6 +1355,10 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::Signal
             if (reason == NpSignaling::ControlReason::Deactivate && conn_id != 0 &&
                 NpHandler::GetInstance().GetSignalingState().peer_transports[transport_id].state ==
                     NpSignaling::ConnState::Established) {
+                NpHandler::GetInstance()
+                    .GetSignalingState()
+                    .peer_transports[transport_id]
+                    .peer_deactivated = true;
                 peer_deactivated_conn = conn_id;
             } else {
                 dead_conn = conn_id;
@@ -1115,6 +1375,9 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const NpSignaling::Signal
 
     if (send_ack && ack_addr != 0 && ack_port != 0) {
         NpSignaling::Transport::ControlSendTo(&ack, sizeof(ack), ack_addr, ack_port);
+    }
+    if (restart_transport != 0) {
+        StartTransportHandshakeInitiator(restart_transport);
     }
     if (establish_transport != 0) {
         EstablishConnection(establish_transport, false);
@@ -1236,12 +1499,27 @@ void StepPendingConnections() {
     const s64 now = NpSignaling::NowUs();
     std::vector<s32> resend;
     std::vector<s32> timeout;
+    std::vector<s32> revalidate_dead;
     std::vector<std::pair<s32, u32>> relay;
 
     {
         NpSignaling::SignalingMutexGuard lock;
         for (auto& [transport_id, transport] :
              NpHandler::GetInstance().GetSignalingState().peer_transports) {
+            // BBSC rejoin fix: a Check every second; no answer in 10 s and the peer is gone.
+            if (transport.revalidating &&
+                transport.state == NpSignaling::ConnState::Established) {
+                if (now - transport.revalidate_since_us >= 10'000'000) {
+                    LOG_INFO(Lib_NpSignaling,
+                             "Transport {} to '{}': no answer in 10 s after activating it again "
+                             "- the peer is gone",
+                             transport_id, OnlineIdString(transport.online_id));
+                    revalidate_dead.push_back(transport_id);
+                } else if (now - transport.last_handshake_send_us >= 1'000'000) {
+                    SendRevalidationCheckLocked(transport);
+                }
+                continue;
+            }
             if (transport.status == NpSignaling::ORBIS_NP_SIGNALING_CONN_STATUS_ACTIVE ||
                 transport.state == NpSignaling::ConnState::Inactive) {
                 continue;
@@ -1294,6 +1572,10 @@ void StepPendingConnections() {
         CloseTransportAndDispatchDead(transport_id, ORBIS_NP_SIGNALING_ERROR_TIMEOUT,
                                       ORBIS_NP_MATCHING2_SIGNALING_ERROR_TIMEOUT);
     }
+    for (const s32 transport_id : revalidate_dead) {
+        CloseTransportAndDispatchDead(transport_id, ORBIS_NP_SIGNALING_ERROR_TIMEOUT,
+                                      ORBIS_NP_MATCHING2_SIGNALING_ERROR_TIMEOUT);
+    }
 }
 
 void ThreadMain() {
@@ -1311,6 +1593,7 @@ void ThreadMain() {
         DrainSignalingPackets();
         StepPendingConnections();
         SendEchoPings();
+        Net::BbscRelayKeepAlive();
         SyncMatching2Peers();
 
         if (last_publish.time_since_epoch().count() == 0 ||
@@ -1534,6 +1817,12 @@ s32 ActivateSig1(NpSignaling::OrbisNpSignalingContextId ctx_id, const OrbisNpId&
                 start_handshake = true;
             }
         }
+        // BBSC rejoin fix: an established transport the game activates afresh (the peer may
+        // have left meanwhile) is checked before it counts as established.
+        if (reused_established && !transport.revalidating &&
+            (transport.peer_deactivated || created_new)) {
+            BeginRevalidationLocked(transport);
+        }
         if (queue_activation) {
             LOG_DEBUG(Lib_NpSignaling,
                       "Signaling activation queued: ctx={} conn={} transport={} peer='{}' "
@@ -1590,6 +1879,7 @@ void HandlePeerConnectRequest(std::string_view peer_online_id, u32 addr, u16 por
                 std::min<size_t>(peer_online_id.size(), ORBIS_NP_ONLINEID_MAX_LENGTH));
     LOG_INFO(Lib_NpSignaling, "Peer connect request from shadNet: peer='{}' endpoint={:#x}:{}",
              peer_online_id, addr, Net::sceNetNtohs(port));
+    Net::BbscRelayRememberPeer(peer_online_id, addr, port);
     // Its ack opens our router to the peer, and our own handshakes follow.
     HandleControlPacket(addr, port, pkt);
 }

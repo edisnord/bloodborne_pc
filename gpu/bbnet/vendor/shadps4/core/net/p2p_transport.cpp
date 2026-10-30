@@ -5,6 +5,7 @@
 #include <cstring>
 #include <tuple>
 
+#include "common/logging/log.h"
 #include "core/net/p2p_transport.h"
 
 #ifndef _WIN32
@@ -180,6 +181,346 @@ void Transport::UseRelayFor(u32 peer_addr) {
     relayed_peers_.insert(peer_addr);
 }
 
+// ---- BBSC relay fallback (from BBSC's bbport-1.7.2 patch, 2026-10-12/13) -----------------------
+// Direct P2P needs one side reachable: CGNAT, strict routers and several windows on one PC (no
+// hairpin) leave both sides unreachable. Peers go through the BBSC game server's UDP relay
+// (gameserver/bbhost_service.py Relay._shad, port 3478 on the shadNet server's address), by
+// online id:
+//   "BBR1" 0x01 id[16]                       register, every 5 s (keeps our NAT mapping open)
+//   "BBR1" 0x02                              registered (from the relay)
+//   "BBR1" 0x03 dst[16] src[16] ep[6] packet  packet for dst
+//   "BBR1" 0x04 src[16] ep[6] packet          packet from src
+//   "BBR1" 0x05 dst[16]                      dst is not on the relay (direct only for 10 s)
+// ep = the sender's own public address and port as shadNet sees them (its STUN echo), so the
+// receiver files the packet under the endpoint its signaling uses for that peer.
+// Every known peer goes through the relay from the first packet; direct copies still go out until
+// the peer answers, and a peer without the relay is answered directly. SHADPS4_P2P_RELAY=0 turns
+// it off, =auto (or direct) = "direct first, relay after 2 s", =a.b.c.d:port another relay;
+// SHADPS4_P2P_RELAY_PORT changes the port (Libraries::Net::SetBbscRelayServer).
+// While the BBSC relay answers, the SuperMedo relay is not used: a BBSC server has none, and
+// a peer switched to it after 4 s of silence would be cut off.
+
+namespace {
+constexpr u8 kBbscMagic[4] = {'B', 'B', 'R', '1'};
+constexpr size_t kBbscIdSize = 16;
+constexpr size_t kBbscEpSize = 6;
+constexpr size_t kBbscEarlyPackets = 32;
+
+std::string BbscPadId(std::string_view online_id) {
+    std::string id(online_id.substr(0, kBbscIdSize));
+    id.resize(kBbscIdSize, '\0');
+    return id;
+}
+
+std::string BbscIdText(const std::string& id) {
+    return std::string(id.c_str());
+}
+
+u64 BbscKey(u32 addr, u16 port) {
+    return (static_cast<u64>(addr) << 16) | port;
+}
+} // namespace
+
+void Transport::SetBbscRelay(std::optional<Endpoint> relay_server, bool force) {
+    std::scoped_lock lock{mutex_};
+    if (bbsc_.server == relay_server && bbsc_.force == force) {
+        return;
+    }
+    bbsc_.server = std::move(relay_server);
+    bbsc_.force = force;
+    bbsc_.acked = false;
+    bbsc_.silence_logged = false;
+    bbsc_.started = Clock::now();
+    bbsc_.last_register = {};
+    if (bbsc_.server) {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(bbsc_.server->Sockaddr());
+        LOG_INFO(Lib_Net, "P2P relay fallback: server {:#x}:{}{}", in->sin_addr.s_addr,
+                 bbsc_.server->Port(), force ? " (forced for every peer)" : "");
+    } else {
+        LOG_INFO(Lib_Net, "P2P relay fallback: off");
+    }
+}
+
+void Transport::SetBbscRelaySelf(u32 addr, u16 port) {
+    std::scoped_lock lock{mutex_};
+    if (bbsc_.self_addr != addr || bbsc_.self_port != port) {
+        LOG_INFO(Lib_Net, "P2P relay fallback: our public endpoint {:#x}:{}", addr, ntohs(port));
+    }
+    bbsc_.self_addr = addr;
+    bbsc_.self_port = port;
+}
+
+void Transport::SetBbscRelayLocalId(std::string_view online_id) {
+    if (online_id.empty()) {
+        return;
+    }
+    std::scoped_lock lock{mutex_};
+    const std::string id = BbscPadId(online_id);
+    if (std::find(bbsc_.local_ids.begin(), bbsc_.local_ids.end(), id) == bbsc_.local_ids.end()) {
+        bbsc_.local_ids.push_back(id);
+        bbsc_.last_register = {};
+    }
+}
+
+void Transport::BbscRelayRememberPeer(std::string_view online_id, u32 addr, u16 port) {
+    if (online_id.empty() || addr == 0 || port == 0) {
+        return;
+    }
+    std::scoped_lock lock{mutex_};
+    const std::string id = BbscPadId(online_id);
+    // Kept by online id; every endpoint signaling or the relay ever gave for it stays an alias
+    // (filed under one endpoint, signaling's sends to another went direct only: one-way relay).
+    BbscPeer& peer = bbsc_.peers[id];
+    peer.id = id;
+    peer.addr = addr;
+    peer.port = port;
+    BbscAddAlias(id, addr, port, "signaling");
+}
+
+void Transport::BbscAddAlias(const std::string& id, u32 addr, u16 port, const char* from) {
+    if (addr == 0 || port == 0) {
+        return;
+    }
+    std::string& known = bbsc_.alias[BbscKey(addr, port)];
+    if (known == id) {
+        return;
+    }
+    known = id;
+    LOG_INFO(Lib_Net, "P2P relay fallback: '{}' known at {:#x}:{} (from {})", BbscIdText(id),
+             addr, ntohs(port), from);
+}
+
+Transport::BbscPeer* Transport::BbscFindPeer(u32 addr, u16 port) {
+    const auto alias = bbsc_.alias.find(BbscKey(addr, port));
+    if (alias == bbsc_.alias.end()) {
+        return nullptr;
+    }
+    const auto it = bbsc_.peers.find(alias->second);
+    return it == bbsc_.peers.end() ? nullptr : &it->second;
+}
+
+void Transport::BbscSendToRelay(const std::vector<u8>& packet) {
+    (void)Host::SendTo(socket_, packet.data(), packet.size(), 0, bbsc_.server->Sockaddr(),
+                       bbsc_.server->Length());
+}
+
+void Transport::BbscRelayKeepAlive() {
+    std::scoped_lock lock{mutex_};
+    if (!bbsc_.server || bbsc_.local_ids.empty()) {
+        return;
+    }
+    const auto now = Clock::now();
+    // Every 5 s once registered, 2 s until then; a server that never answered in 30 s has no
+    // BBSC relay (SuperMedo Server, The Hunter's Dream): asked every 30 s only.
+    const bool silent = !bbsc_.acked && now - bbsc_.started >= std::chrono::seconds(30);
+    if (silent && !bbsc_.silence_logged) {
+        bbsc_.silence_logged = true;
+        LOG_INFO(Lib_Net, "P2P relay fallback: no BBSC relay answers on this server - direct "
+                          "connections only (asked again every 30 s)");
+    }
+    const auto interval = bbsc_.acked ? std::chrono::seconds(5)
+                          : silent    ? std::chrono::seconds(30)
+                                      : std::chrono::seconds(2);
+    if (bbsc_.last_register != Clock::time_point{} && now - bbsc_.last_register < interval) {
+        return;
+    }
+    bbsc_.last_register = now;
+    if (now - bbsc_.last_status >= std::chrono::seconds(30) &&
+        (bbsc_.sent != bbsc_.status_sent || bbsc_.received != bbsc_.status_received)) {
+        bbsc_.last_status = now;
+        bbsc_.status_sent = bbsc_.sent;
+        bbsc_.status_received = bbsc_.received;
+        std::string peers;
+        for (const auto& [id, peer] : bbsc_.peers) {
+            if (!peers.empty()) {
+                peers += ", ";
+            }
+            peers += BbscIdText(peer.id);
+            peers += !peer.relayed                 ? " direct"
+                     : now < peer.missing_until    ? " not on the relay"
+                     : peer.relay_seen             ? " relay"
+                                                   : " relay (no answer yet)";
+        }
+        LOG_INFO(Lib_Net,
+                 "P2P relay fallback: {} packet(s) sent / {} received through the relay so far; "
+                 "peers: {}",
+                 bbsc_.sent, bbsc_.received, peers.empty() ? "none" : peers);
+    }
+    for (const std::string& id : bbsc_.local_ids) {
+        std::vector<u8> packet(std::begin(kBbscMagic), std::end(kBbscMagic));
+        packet.push_back(0x01);
+        packet.insert(packet.end(), id.begin(), id.end());
+        BbscSendToRelay(packet);
+    }
+}
+
+Transport::BbscPath Transport::BbscRoute(std::span<const u8> packet, u32 addr, u16 port) {
+    if (!bbsc_.server || !bbsc_.acked || bbsc_.local_ids.empty()) {
+        return BbscPath::Direct;
+    }
+    BbscPeer* const found = BbscFindPeer(addr, port);
+    if (found == nullptr) {
+        return BbscPath::Direct;
+    }
+    BbscPeer& peer = *found;
+    const auto now = Clock::now();
+    if (peer.relayed && now < peer.missing_until) {
+        return BbscPath::Direct;
+    }
+    if (!peer.relayed) {
+        if (bbsc_.force) {
+            peer.relayed = true;
+        } else if (!peer.tx_started) {
+            peer.tx_started = true;
+            peer.first_tx = now;
+        } else if (!peer.direct_rx && now - peer.first_tx >= std::chrono::seconds(2)) {
+            peer.relayed = true;
+        }
+        if (!peer.relayed) {
+            // Kept for the switch: signaling sends some packets only once (the activation
+            // request); lost directly, the peer ignores everything after it.
+            if (!peer.direct_rx && peer.early.size() < kBbscEarlyPackets) {
+                peer.early.emplace_back(packet.begin(), packet.end());
+            }
+            return BbscPath::Direct;
+        }
+        peer.relayed_since = now;
+        LOG_INFO(Lib_Net,
+                 "P2P relay fallback: '{}' at {:#x}:{} {} - through the relay ({} earlier "
+                 "packet(s) sent again)",
+                 BbscIdText(peer.id), peer.addr, ntohs(peer.port),
+                 bbsc_.force ? "(forced)" : "sent nothing back directly in 2 s",
+                 peer.early.size());
+        for (const std::vector<u8>& early : peer.early) {
+            BbscSendRelayed(peer, early);
+        }
+        peer.early.clear();
+        peer.early.shrink_to_fit();
+    }
+    BbscSendRelayed(peer, packet);
+    // After the switch, packets still go directly too until the peer answers either way: an
+    // emulator without the relay can only be reached directly. A peer that uses the relay gets
+    // direct copies for 10 s more, then the relay alone.
+    const bool direct_copy =
+        !peer.direct_rx && (!peer.relay_seen || now - peer.relayed_since < std::chrono::seconds(10));
+    return direct_copy ? BbscPath::Both : BbscPath::Relay;
+}
+
+void Transport::BbscSendRelayed(const BbscPeer& peer, std::span<const u8> packet) {
+    const std::string& self = bbsc_.local_ids.front();
+    std::vector<u8> framed;
+    framed.reserve(5 + 2 * kBbscIdSize + kBbscEpSize + packet.size());
+    framed.insert(framed.end(), std::begin(kBbscMagic), std::end(kBbscMagic));
+    framed.push_back(0x03);
+    framed.insert(framed.end(), peer.id.begin(), peer.id.end());
+    framed.insert(framed.end(), self.begin(), self.end());
+    u8 ep[kBbscEpSize];
+    std::memcpy(ep, &bbsc_.self_addr, 4);
+    std::memcpy(ep + 4, &bbsc_.self_port, 2);
+    framed.insert(framed.end(), ep, ep + kBbscEpSize);
+    framed.insert(framed.end(), packet.begin(), packet.end());
+    BbscSendToRelay(framed);
+    ++bbsc_.sent;
+}
+
+void Transport::BbscNoteDirect(u32 addr, u16 port) {
+    if (bbsc_.peers.empty()) {
+        return;
+    }
+    BbscPeer* const found = BbscFindPeer(addr, port);
+    if (found == nullptr || found->direct_rx) {
+        return;
+    }
+    BbscPeer& peer = *found;
+    peer.direct_rx = true;
+    peer.early.clear();
+    if (peer.relayed && !peer.relay_seen) {
+        // It answers directly and never used the relay (an emulator without it, or a NAT hole
+        // that took longer than 2 s): direct from now on.
+        peer.relayed = false;
+        LOG_INFO(Lib_Net, "P2P relay fallback: '{}' reached us directly - back to direct",
+                 BbscIdText(peer.id));
+    } else {
+        LOG_INFO(Lib_Net, "P2P relay fallback: '{}' reached us directly{}", BbscIdText(peer.id),
+                 peer.relayed ? " (staying on the relay)" : "");
+    }
+}
+
+void Transport::BbscReceive(std::span<const u8> packet, Clock::time_point now) {
+    if (packet.size() < 5 || std::memcmp(packet.data(), kBbscMagic, 4) != 0) {
+        return;
+    }
+    const u8 kind = packet[4];
+    if (kind == 0x02) {
+        if (!bbsc_.acked) {
+            bbsc_.acked = true;
+            LOG_INFO(Lib_Net, "P2P relay fallback: registered with the relay");
+        }
+        return;
+    }
+    if (kind == 0x05 && packet.size() >= 5 + kBbscIdSize) {
+        const std::string id(reinterpret_cast<const char*>(packet.data() + 5), kBbscIdSize);
+        const auto known = bbsc_.peers.find(id);
+        if (known != bbsc_.peers.end()) {
+            BbscPeer& peer = known->second;
+            peer.missing_until = now + std::chrono::seconds(10);
+            if (!peer.missing_logged) {
+                peer.missing_logged = true;
+                LOG_WARNING(Lib_Net,
+                            "P2P relay fallback: '{}' is not on the relay (no relay in its build, "
+                            "or it is not running) - direct only; if direct does not work "
+                            "either, it cannot connect",
+                            BbscIdText(peer.id));
+            }
+        }
+        return;
+    }
+    if (kind != 0x04 || packet.size() < 5 + kBbscIdSize + kBbscEpSize) {
+        return;
+    }
+    const std::string id(reinterpret_cast<const char*>(packet.data() + 5), kBbscIdSize);
+    u32 ep_addr = 0;
+    u16 ep_port = 0;
+    std::memcpy(&ep_addr, packet.data() + 5 + kBbscIdSize, 4);
+    std::memcpy(&ep_port, packet.data() + 5 + kBbscIdSize + 4, 2);
+    if (!bbsc_.peers.contains(id)) {
+        // A peer signaling never looked up: the endpoint it gave, else a made-up one
+        // (169.254.x.x, never sent to directly) so the answers go back through the relay.
+        BbscPeer& made = bbsc_.peers[id];
+        made.id = id;
+        if (ep_addr != 0 && ep_port != 0) {
+            made.addr = ep_addr;
+            made.port = ep_port;
+        } else {
+            made.addr = htonl(0xA9FE0000u | (bbsc_.next_pseudo++ & 0xFFFFu));
+            made.port = htons(3173);
+        }
+        BbscAddAlias(id, made.addr, made.port, "relay, new peer");
+    }
+    // Its own endpoint is one more alias; the peer keeps the endpoint signaling knows, so the
+    // packet below arrives from where signaling expects it.
+    BbscAddAlias(id, ep_addr, ep_port, "relay");
+    BbscPeer& peer = bbsc_.peers[id];
+    peer.relay_seen = true;
+    peer.missing_until = {};
+    if (!peer.relayed) {
+        peer.relayed = true;
+        peer.relayed_since = now;
+        LOG_INFO(Lib_Net,
+                 "P2P relay fallback: '{}' reached us through the relay - answering the same way",
+                 BbscIdText(peer.id));
+    }
+    ++bbsc_.received;
+    sockaddr_in source{};
+    source.sin_family = AF_INET;
+    source.sin_addr.s_addr = peer.addr;
+    source.sin_port = peer.port;
+    const size_t head = 5 + kBbscIdSize + kBbscEpSize;
+    HandlePacket(packet.subspan(head),
+                 Endpoint::FromSockaddr(reinterpret_cast<const sockaddr*>(&source), sizeof(source)),
+                 now, true);
+}
+
 std::shared_ptr<DatagramSocket> Transport::CreateDatagram() {
     return std::shared_ptr<DatagramSocket>(new DatagramSocket(shared_from_this()));
 }
@@ -286,7 +627,20 @@ Error Transport::SendPacket(std::span<const u8> packet, const Endpoint& to) {
             return Error::Ok;
         }
     }
-    if (relay_server_ && to.Family() == AF_INET) {
+    if (bbsc_.server && to.Family() == AF_INET) {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(to.Sockaddr());
+        const BbscPath path = BbscRoute(packet, in->sin_addr.s_addr, in->sin_port);
+        if (path == BbscPath::Relay) {
+            return Error::Ok;
+        }
+        if (path == BbscPath::Both) {
+            (void)Host::SendTo(socket_, packet.data(), packet.size(), 0, to.Sockaddr(),
+                               to.Length());
+            return Error::Ok;
+        }
+    }
+    // Not while the BBSC relay answers: that server has no SuperMedo relay.
+    if (relay_server_ && !bbsc_.acked && to.Family() == AF_INET) {
         const auto* in = reinterpret_cast<const sockaddr_in*>(to.Sockaddr());
         if (relayed_peers_.contains(in->sin_addr.s_addr)) {
             std::vector<u8> framed(kRelayHeaderSize + packet.size());
@@ -336,8 +690,12 @@ u16 Transport::AllocateVport(bool stream) {
 }
 
 void Transport::HandlePacket(std::span<const u8> packet, const Endpoint& from,
-                             Clock::time_point now) {
-    if (relay_server_ && from == *relay_server_ && packet.size() > kRelayHeaderSize &&
+                             Clock::time_point now, bool relayed) {
+    if (!relayed && bbsc_.server && from == *bbsc_.server) {
+        BbscReceive(packet, now);
+        return;
+    }
+    if (!relayed && relay_server_ && from == *relay_server_ && packet.size() > kRelayHeaderSize &&
         std::memcmp(packet.data(), kRelayMagic, 4) == 0 && packet[4] == kRelayDeliver) {
         sockaddr_in source{};
         source.sin_family = AF_INET;
@@ -347,8 +705,12 @@ void Transport::HandlePacket(std::span<const u8> packet, const Endpoint& from,
         HandlePacket(packet.subspan(kRelayHeaderSize),
                      Endpoint::FromSockaddr(reinterpret_cast<const sockaddr*>(&source),
                                             sizeof(source)),
-                     now);
+                     now, true);
         return;
+    }
+    if (!relayed && from.Family() == AF_INET) {
+        const auto* in = reinterpret_cast<const sockaddr_in*>(from.Sockaddr());
+        BbscNoteDirect(in->sin_addr.s_addr, in->sin_port);
     }
     Codec::Decoded decoded = codec_->Decode(packet, from);
     switch (decoded.kind) {

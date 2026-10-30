@@ -161,6 +161,17 @@ struct PeerTransport {
     s64 last_handshake_send_us = 0;
     s64 handshake_start_us = 0; // first handshake send of the current attempt
     bool relayed = false;       // switched to the shadNet relay
+
+    // BBSC rejoin fix (from BBSC's bbport-1.7.2 patch, 2026-10-12): the peer's transport id
+    // from its packets - a new one on an established transport means the peer started over (left
+    // and came back, or restarted the game).
+    u32 peer_conn_id = 0;
+    // The peer deactivated (Close, Deactivate) while established.
+    bool peer_deactivated = false;
+    // Activated again while established: it counts as established only once the peer answers
+    // a Check (10 s, else DEAD) - a peer that had left must not keep it "active" forever.
+    bool revalidating = false;
+    s64 revalidate_since_us = 0;
 };
 
 struct ConnectionInfo {

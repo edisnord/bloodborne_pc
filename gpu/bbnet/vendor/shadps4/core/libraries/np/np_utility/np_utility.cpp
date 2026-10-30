@@ -204,16 +204,15 @@ s32 PS4_SYSV_ABI sceNpLookupNpId(OrbisNpLookupRequestId reqId, const OrbisNpOnli
         req->used = true;
     }
 
-    // Global online ID to account ID resolution
+    // BBSC (from its bbport-1.7.2 patch, 2026-10-06 4-player test): answered from the online id
+    // at once. The game looks up every other player when a 3rd one joins; BBSC's shadNet server
+    // has no LookupOnlineId, so the server lookup failed or never came back, the game passed an
+    // empty NpId to sceNpSignalingActivateConnection and left the room. On shadNet an NpId is
+    // just the online id in its handle, and the ids the game looks up come from its room.
+    (void)searching_user_id;
     const std::string targetOnlineId(OnlineIdView(*onlineId));
-    Libraries::Np::NpHandler::GetInstance().ResolveOnlineId(
-        searching_user_id, targetOnlineId,
-        [req, npId](s32 result, u64 /*accountId*/, const std::string& canonicalOnlineId) {
-            if (result == ORBIS_OK && npId != nullptr) {
-                SetNpId(*npId, canonicalOnlineId);
-            }
-            req->SetResult(result);
-        });
+    SetNpId(*npId, targetOnlineId);
+    req->SetResult(ORBIS_OK);
 
     if (!req->isAsync) {
         return req->Wait();
